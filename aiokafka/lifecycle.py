@@ -76,6 +76,9 @@ ConnectionFailedCallback = Callable[[ConnectionInfo, Exception], Awaitable[None]
 class _ConnectionCallbacks:
     # One deadline for all observers, independent of request_timeout_ms.
     _SHUTDOWN_TIMEOUT = 5.0
+    # An attempt emits either failed or opened/closed, so limiting the
+    # number of pending connections bounds both tasks and retained events.
+    _MAX_PENDING_CONNECTIONS = 128
 
     def __init__(
         self,
@@ -94,6 +97,7 @@ class _ConnectionCallbacks:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._closed = False
         self._cancelled = False
+        self._overflow_warned = False
 
     def emit(self, event: str, info: ConnectionInfo, *args: Any) -> None:
         if self._closed or self._callbacks[event] is None:
@@ -105,6 +109,16 @@ class _ConnectionCallbacks:
             return
         connection_id = info.connection_id
         if connection_id not in self._queues:
+            if len(self._tasks) >= self._MAX_PENDING_CONNECTIONS:
+                if not self._overflow_warned:
+                    self._overflow_warned = True
+                    log.warning(
+                        "Connection observer limit reached (%s pending connections); "
+                        "dropping notifications for other connections",
+                        self._MAX_PENDING_CONNECTIONS,
+                    )
+                return
+            self._overflow_warned = False
             self._queues[connection_id] = deque()
             task = self._loop.create_task(self._run(connection_id))
             self._tasks[connection_id] = task

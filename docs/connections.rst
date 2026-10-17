@@ -103,6 +103,20 @@ no ordering guarantee. By the time a callback runs, the connection may already
 have closed. Callback completion is not required for ``start()`` or a request
 to return.
 
+Dispatch is limited to **128 connections with pending callback work per client**,
+including callbacks that are currently running. Each connection attempt emits
+at most an opening and a closing event, or a single failure event. If the limit
+is reached, notifications for additional connections are dropped before
+creating tasks or retaining their exceptions. Closing events for connections
+already being dispatched remain queued behind their opening event. Kafka
+connection attempts and requests continue without waiting for observer capacity.
+
+A warning is logged on the first dropped notification in each overload episode.
+Delivery resumes for new notifications when capacity becomes available; dropped
+notifications are not replayed. Observers must tolerate missing notifications,
+including a closing event whose opening event was dropped during overload.
+This bound also applies when a callback never finishes.
+
 Keep callbacks short and avoid blocking the event loop. Defer longer work to
 application tasks. Callbacks are never awaited by connection establishment,
 including while its connection lock is held.

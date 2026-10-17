@@ -741,3 +741,77 @@ async def test_cancel_observers_before_dispatch_starts():
         opened.assert_not_called()
     finally:
         current.uncancel()
+
+
+@pytest.mark.parametrize("dispatch_started", [False, True])
+async def test_failed_retries_bound_stalled_observers(
+    client, transport_factory, monkeypatch, caplog, dispatch_started
+):
+    limit = 3
+    monkeypatch.setattr(_ConnectionCallbacks, "_MAX_PENDING_CONNECTIONS", limit)
+    release = asyncio.Event()
+
+    async def failed(info, error):
+        await release.wait()
+
+    callback(client, "failed").side_effect = failed
+    transport_factory.side_effect = OSError("broker unavailable")
+    dispatcher = client._connection_callbacks
+    try:
+        for _ in range(limit):
+            assert await client._get_conn(1) is None
+        if dispatch_started:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert callback(client, "failed").call_count == limit
+        for _ in range(20):
+            assert await client._get_conn(1) is None
+        assert transport_factory.await_count == limit + 20
+        assert len(dispatcher._tasks) == limit
+        assert len(dispatcher._queues) == limit
+        queued = sum(len(queue) for queue in dispatcher._queues.values())
+        assert queued == (0 if dispatch_started else limit)
+        assert caplog.text.count("Connection observer limit reached") == 1
+    finally:
+        release.set()
+        await drain(client)
+
+    assert callback(client, "failed").call_count == limit
+    assert not dispatcher._tasks
+    assert not dispatcher._queues
+    # Capacity recovers without replaying notifications dropped under overload.
+    assert await client._get_conn(1) is None
+    await drain(client)
+    assert callback(client, "failed").call_count == limit + 1
+
+
+async def test_overload_preserves_accepted_connection_order(client, monkeypatch):
+    monkeypatch.setattr(_ConnectionCallbacks, "_MAX_PENDING_CONNECTIONS", 1)
+    entered, release = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def opened(info):
+        entered.set()
+        await release.wait()
+        events.append(("opened", info.node_id))
+
+    callback(client, "opened").side_effect = opened
+    callback(client, "closed").side_effect = lambda info, *_: events.append(
+        ("closed", info.node_id)
+    )
+    first = await client._get_conn(1)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    try:
+        second = await client._get_conn(2)
+        assert second.connected()
+        first.close()
+        assert len(client._connection_callbacks._tasks) == 1
+        assert events == []
+    finally:
+        release.set()
+        await drain(client)
+    assert events == [("opened", 1), ("closed", 1)]
+    # Delivery can resume at closure even when this connection's open was dropped.
+    second.close()
+    await drain(client)
+    assert events == [("opened", 1), ("closed", 1), ("closed", 2)]
