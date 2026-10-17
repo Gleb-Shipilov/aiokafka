@@ -185,7 +185,10 @@ class TestKafkaClientIntegration(KafkaIntegrationTestCase):
         with self.assertRaises(RequestTimedOutError):
             await client.send(0, MetadataRequest([]))
 
-        conn.close.assert_called_once_with(reason=CloseReason.CONNECTION_TIMEOUT)
+        conn.close.assert_called_once_with(
+            reason=CloseReason.CONNECTION_TIMEOUT, exc=mock.ANY
+        )
+        self.assertIsInstance(conn.close.call_args.kwargs["exc"], TimeoutError)
         # this happens because conn was closed
         conn.connected.return_value = False
 

@@ -15,10 +15,10 @@ import traceback
 import uuid
 import warnings
 import weakref
-from enum import IntEnum
 
 import aiokafka.errors as Errors
 from aiokafka.abc import AbstractTokenProvider
+from aiokafka.connection import ConnectionCloseReason as CloseReason
 from aiokafka.protocol.admin import (
     ApiVersionRequest,
     SaslAuthenticateRequest,
@@ -40,15 +40,6 @@ DEFAULT_KAFKA_PORT = 9092
 
 READER_LIMIT = 2**16
 SASL_QOP_AUTH = 1
-
-
-class CloseReason(IntEnum):
-    CONNECTION_BROKEN = 0
-    CONNECTION_TIMEOUT = 1
-    OUT_OF_SYNC = 2
-    IDLE_DROP = 3
-    SHUTDOWN = 4
-    AUTH_FAILURE = 5
 
 
 async def create_conn(
@@ -169,6 +160,7 @@ class AIOKafkaConnection:
         self._idle_handle = None
 
         self._on_close_cb = on_close
+        self._close_exception = None
 
         if loop.get_debug():
             self._source_traceback = traceback.extract_stack(sys._getframe(1))
@@ -420,7 +412,7 @@ class AIOKafkaConnection:
         try:
             self._writer.write(size + message)
         except OSError as err:
-            self.close(reason=CloseReason.CONNECTION_BROKEN)
+            self.close(reason=CloseReason.CONNECTION_BROKEN, exc=err)
             raise Errors.KafkaConnectionError(
                 f"Connection at {self._host}:{self._port} broken: {err}"
             ) from err
@@ -450,7 +442,7 @@ class AIOKafkaConnection:
         try:
             self._writer.write(size + payload)
         except OSError as err:
-            self.close(reason=CloseReason.CONNECTION_BROKEN)
+            self.close(reason=CloseReason.CONNECTION_BROKEN, exc=err)
             raise Errors.KafkaConnectionError(
                 f"Connection at {self._host}:{self._port} broken: {err}"
             ) from err
@@ -470,6 +462,8 @@ class AIOKafkaConnection:
             "Closing connection at %s:%s (%s, %s)", self._host, self._port, reason, exc
         )
         if self._reader is not None:
+            # Preserve the error without changing the low-level on_close API.
+            self._close_exception = exc
             self._writer.close()
             self._writer = self._reader = None
             if not self._read_task.done():
@@ -557,7 +551,7 @@ class AIOKafkaConnection:
                 )
                 if not fut.done():
                     fut.set_exception(error)
-                self.close(reason=CloseReason.OUT_OF_SYNC)
+                self.close(reason=CloseReason.OUT_OF_SYNC, exc=error)
                 return
 
             if not fut.done():

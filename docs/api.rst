@@ -38,6 +38,22 @@ Metrics
 .. autoclass:: aiokafka.metrics.ProducerMetricsCollector
     :members:
 
+Connection lifecycle
+--------------------
+
+See :ref:`connection-lifecycle` for callback semantics and examples.
+
+.. autoclass:: aiokafka.ConnectionInfo
+    :members:
+
+.. autoclass:: aiokafka.ConnectionCloseReason
+    :members:
+    :undoc-members:
+
+.. autoclass:: aiokafka.ConnectionGroup
+    :members:
+    :undoc-members:
+
 Abstracts
 ---------
 

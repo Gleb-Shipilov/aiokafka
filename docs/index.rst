@@ -162,6 +162,7 @@ Contents:
 
    producer
    metrics
+   connections
    consumer
    kafka-python_difference
    api

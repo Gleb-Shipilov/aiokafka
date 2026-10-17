@@ -6,6 +6,11 @@ import warnings
 
 from aiokafka.client import AIOKafkaClient
 from aiokafka.codec import has_gzip, has_lz4, has_snappy, has_zstd
+from aiokafka.connection import (
+    ConnectionClosedCallback,
+    ConnectionFailedCallback,
+    ConnectionOpenedCallback,
+)
 from aiokafka.errors import (
     IllegalOperation,
     MessageSizeTooLargeError,
@@ -180,6 +185,19 @@ class AIOKafkaProducer:
             metrics. Defaults to a no-op collector. This API is experimental
             and may change without a deprecation period.
 
+        on_connection_opened: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo` after connection establishment,
+            including TLS/SASL negotiation. Default: ``None``.
+        on_connection_closed: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo`, a
+            :class:`~aiokafka.ConnectionCloseReason` (or ``None``), and the
+            closing exception (or ``None``). Default: ``None``.
+        on_connection_failed: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo` and the connection establishment
+            exception. Default: ``None``. All connection observers may return
+            an awaitable. See :ref:`connection-lifecycle` for ordering and
+            shutdown behavior.
+
     Note:
         Many configuration parameters are taken from the Java client:
         https://kafka.apache.org/documentation.html#producerconfigs
@@ -228,6 +246,9 @@ class AIOKafkaProducer:
         sasl_kerberos_domain_name=None,
         sasl_oauth_token_provider=None,
         metrics_collector=None,
+        on_connection_opened: ConnectionOpenedCallback | None = None,
+        on_connection_closed: ConnectionClosedCallback | None = None,
+        on_connection_failed: ConnectionFailedCallback | None = None,
     ):
         if loop is None:
             loop = get_running_loop()
@@ -322,6 +343,9 @@ class AIOKafkaProducer:
             sasl_kerberos_service_name=sasl_kerberos_service_name,
             sasl_kerberos_domain_name=sasl_kerberos_domain_name,
             sasl_oauth_token_provider=sasl_oauth_token_provider,
+            on_connection_opened=on_connection_opened,
+            on_connection_closed=on_connection_closed,
+            on_connection_failed=on_connection_failed,
         )
         self._metadata = self.client.cluster
         self._message_accumulator = MessageAccumulator(

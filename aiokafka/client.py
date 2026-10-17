@@ -5,11 +5,20 @@ import random
 import time
 import warnings
 from enum import IntEnum
+from uuid import uuid4
 
 import aiokafka.errors as Errors
 from aiokafka import __version__
 from aiokafka.cluster import ClusterMetadata
 from aiokafka.conn import CloseReason, collect_hosts, create_conn
+from aiokafka.connection import (
+    ConnectionClosedCallback,
+    ConnectionFailedCallback,
+    ConnectionGroup,
+    ConnectionInfo,
+    ConnectionOpenedCallback,
+    _ConnectionCallbacks,
+)
 from aiokafka.errors import (
     KafkaConnectionError,
     KafkaError,
@@ -31,11 +40,6 @@ __all__ = ["AIOKafkaClient"]
 
 
 log = logging.getLogger("aiokafka")
-
-
-class ConnectionGroup(IntEnum):
-    DEFAULT = 0
-    COORDINATION = 1
 
 
 class CoordinationType(IntEnum):
@@ -75,6 +79,18 @@ class AIOKafkaClient:
         connections_max_idle_ms (int): Close idle connections after the number
             of milliseconds specified by this config. Specifying `None` will
             disable idle checks. Default: 540000 (9 minutes).
+        on_connection_opened: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo` after connection establishment,
+            including TLS/SASL negotiation. Default: ``None``.
+        on_connection_closed: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo`, a
+            :class:`~aiokafka.ConnectionCloseReason` (or ``None``), and the
+            closing exception (or ``None``). Default: ``None``.
+        on_connection_failed: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo` and the connection establishment
+            exception. Default: ``None``. All connection observers may return
+            an awaitable. See :ref:`connection-lifecycle` for ordering and
+            shutdown behavior.
     """
 
     def __init__(
@@ -96,6 +112,9 @@ class AIOKafkaClient:
         sasl_kerberos_service_name="kafka",
         sasl_kerberos_domain_name=None,
         sasl_oauth_token_provider=None,
+        on_connection_opened: ConnectionOpenedCallback | None = None,
+        on_connection_closed: ConnectionClosedCallback | None = None,
+        on_connection_failed: ConnectionFailedCallback | None = None,
     ):
         if loop is None:
             loop = get_running_loop()
@@ -133,6 +152,19 @@ class AIOKafkaClient:
                     "sasl_plain_username and sasl_plain_password required for "
                     "PLAIN sasl"
                 )
+
+        self._connection_callbacks = None
+        if any(
+            callback is not None
+            for callback in (
+                on_connection_opened,
+                on_connection_closed,
+                on_connection_failed,
+            )
+        ):
+            self._connection_callbacks = _ConnectionCallbacks(
+                on_connection_opened, on_connection_closed, on_connection_failed
+            )
 
         self._bootstrap_servers = bootstrap_servers
         self._client_id = client_id
@@ -184,8 +216,12 @@ class AIOKafkaClient:
         futs = [
             conn.close(reason=CloseReason.SHUTDOWN) for conn in self._conns.values()
         ]
-        if futs:
-            await asyncio.gather(*futs)
+        try:
+            if futs:
+                await asyncio.gather(*futs)
+        finally:
+            if self._connection_callbacks is not None:
+                await self._connection_callbacks.close()
 
     async def bootstrap(self):
         """Try to to bootstrap initial cluster metadata"""
@@ -197,21 +233,7 @@ class AIOKafkaClient:
             log.debug("Attempting to bootstrap via node at %s:%s", host, port)
 
             try:
-                bootstrap_conn = await create_conn(
-                    host,
-                    port,
-                    client_id=self._client_id,
-                    request_timeout_ms=self._request_timeout_ms,
-                    ssl_context=self._ssl_context,
-                    security_protocol=self._security_protocol,
-                    max_idle_ms=self._connections_max_idle_ms,
-                    sasl_mechanism=self._sasl_mechanism,
-                    sasl_plain_username=self._sasl_plain_username,
-                    sasl_plain_password=self._sasl_plain_password,
-                    sasl_kerberos_service_name=self._sasl_kerberos_service_name,
-                    sasl_kerberos_domain_name=self._sasl_kerberos_domain_name,
-                    sasl_oauth_token_provider=self._sasl_oauth_token_provider,
-                )
+                bootstrap_conn = await self._create_connection(host, port)
             except (TimeoutError, OSError, KafkaError) as err:
                 log.error('Unable connect to "%s:%s": %s', host, port, err)
                 continue
@@ -377,6 +399,62 @@ class AIOKafkaClient:
         self._topics = set(topics)
         return res
 
+    async def _create_connection(
+        self, host, port, *, node_id=None, group=ConnectionGroup.DEFAULT
+    ):
+        callbacks = self._connection_callbacks
+        on_close = self._on_connection_closed if node_id is not None else None
+        established = False
+        close_event = None
+        if callbacks is not None:
+            info = ConnectionInfo(
+                client_id=self._client_id,
+                connection_id=uuid4().hex,
+                node_id=node_id,
+                host=host,
+                port=port,
+                connection_group=group,
+            )
+            internal_on_close = on_close
+
+            def on_close(conn, reason):
+                nonlocal close_event
+                if internal_on_close is not None:
+                    internal_on_close(conn, reason)
+                close_event = (reason, conn._close_exception)
+                if established:
+                    callbacks.emit("closed", info, *close_event)
+
+        try:
+            conn = await create_conn(
+                host,
+                port,
+                client_id=self._client_id,
+                request_timeout_ms=self._request_timeout_ms,
+                ssl_context=self._ssl_context,
+                security_protocol=self._security_protocol,
+                on_close=on_close,
+                max_idle_ms=self._connections_max_idle_ms,
+                sasl_mechanism=self._sasl_mechanism,
+                sasl_plain_username=self._sasl_plain_username,
+                sasl_plain_password=self._sasl_plain_password,
+                sasl_kerberos_service_name=self._sasl_kerberos_service_name,
+                sasl_kerberos_domain_name=self._sasl_kerberos_domain_name,
+                sasl_oauth_token_provider=self._sasl_oauth_token_provider,
+            )
+        except Exception as exc:
+            if callbacks is not None:
+                callbacks.emit("failed", info, exc)
+            raise
+        if callbacks is not None:
+            established = True
+            callbacks.emit("opened", info)
+            # A connection may close as the final handshake response arrives.
+            # If establishment failed instead, only "failed" is emitted above.
+            if close_event is not None:
+                callbacks.emit("closed", info, *close_event)
+        return conn
+
     def _on_connection_closed(self, conn, reason):
         """Callback called when connection is closed"""
         # Connection failures imply that our metadata is stale, so let's
@@ -415,21 +493,8 @@ class AIOKafkaClient:
                 if conn_id in self._conns:
                     return self._conns[conn_id]
 
-                self._conns[conn_id] = await create_conn(
-                    broker.host,
-                    broker.port,
-                    client_id=self._client_id,
-                    request_timeout_ms=self._request_timeout_ms,
-                    ssl_context=self._ssl_context,
-                    security_protocol=self._security_protocol,
-                    on_close=self._on_connection_closed,
-                    max_idle_ms=self._connections_max_idle_ms,
-                    sasl_mechanism=self._sasl_mechanism,
-                    sasl_plain_username=self._sasl_plain_username,
-                    sasl_plain_password=self._sasl_plain_password,
-                    sasl_kerberos_service_name=self._sasl_kerberos_service_name,
-                    sasl_kerberos_domain_name=self._sasl_kerberos_domain_name,
-                    sasl_oauth_token_provider=self._sasl_oauth_token_provider,
+                self._conns[conn_id] = await self._create_connection(
+                    broker.host, broker.port, node_id=node_id, group=group
                 )
         except (TimeoutError, OSError, KafkaError) as err:
             log.error("Unable connect to node with id %s: %s", node_id, err)
@@ -478,7 +543,9 @@ class AIOKafkaClient:
             result = await future
         except TimeoutError as exc:
             # close connection so it is renewed in next request
-            self._conns[(node_id, group)].close(reason=CloseReason.CONNECTION_TIMEOUT)
+            self._conns[(node_id, group)].close(
+                reason=CloseReason.CONNECTION_TIMEOUT, exc=exc
+            )
             raise RequestTimedOutError() from exc
         else:
             return result

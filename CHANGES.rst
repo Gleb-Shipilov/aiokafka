@@ -7,6 +7,9 @@ Changelog
 
 New features:
 
+* Add optional connection lifecycle callbacks to consumers and producers, with
+  public connection descriptions and closing reasons (issue #1197)
+
 * Use standard library Zstandard compression on Python 3.14 and newer, without
   requiring cramjam for the ``zstd`` extra (issue #1146)
 * Add an experimental lightweight callback-based producer metrics collector API

@@ -2,6 +2,14 @@ __version__ = "0.15.0rc1"
 
 from .abc import ConsumerRebalanceListener
 from .client import AIOKafkaClient
+from .connection import (
+    ConnectionClosedCallback,
+    ConnectionCloseReason,
+    ConnectionFailedCallback,
+    ConnectionGroup,
+    ConnectionInfo,
+    ConnectionOpenedCallback,
+)
 from .consumer import AIOKafkaConsumer
 from .errors import ConsumerStoppedError, IllegalOperation
 from .metrics import ProducerMetricsCollector
@@ -18,6 +26,13 @@ __all__ = [  # noqa: RUF022
     "AIOKafkaProducer",
     "AIOKafkaConsumer",
     "AIOKafkaClient",
+    # Connection lifecycle
+    "ConnectionInfo",
+    "ConnectionGroup",
+    "ConnectionCloseReason",
+    "ConnectionOpenedCallback",
+    "ConnectionClosedCallback",
+    "ConnectionFailedCallback",
     # Metrics
     "ProducerMetricsCollector",
     # ABC's

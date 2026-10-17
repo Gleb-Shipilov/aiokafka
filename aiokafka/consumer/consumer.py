@@ -8,6 +8,11 @@ import warnings
 from aiokafka import __version__
 from aiokafka.abc import ConsumerRebalanceListener
 from aiokafka.client import AIOKafkaClient
+from aiokafka.connection import (
+    ConnectionClosedCallback,
+    ConnectionFailedCallback,
+    ConnectionOpenedCallback,
+)
 from aiokafka.coordinator.assignors.roundrobin import RoundRobinPartitionAssignor
 from aiokafka.errors import (
     ConsumerStoppedError,
@@ -218,6 +223,19 @@ class AIOKafkaConsumer:
             the consumer will fetch from the closest in-sync replica
             instead of the leader (KIP-392). Default: ``None`` (disabled).
 
+        on_connection_opened: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo` after connection establishment,
+            including TLS/SASL negotiation. Default: ``None``.
+        on_connection_closed: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo`, a
+            :class:`~aiokafka.ConnectionCloseReason` (or ``None``), and the
+            closing exception (or ``None``). Default: ``None``.
+        on_connection_failed: Optional observer called with
+            :class:`~aiokafka.ConnectionInfo` and the connection establishment
+            exception. Default: ``None``. All connection observers may return
+            an awaitable. See :ref:`connection-lifecycle` for ordering and
+            shutdown behavior.
+
     Note:
         Many configuration parameters are taken from Java Client:
         https://kafka.apache.org/documentation.html#newconsumerconfigs
@@ -268,6 +286,9 @@ class AIOKafkaConsumer:
         sasl_kerberos_domain_name=None,
         sasl_oauth_token_provider=None,
         client_rack=None,
+        on_connection_opened: ConnectionOpenedCallback | None = None,
+        on_connection_closed: ConnectionClosedCallback | None = None,
+        on_connection_failed: ConnectionFailedCallback | None = None,
     ):
         if loop is None:
             loop = get_running_loop()
@@ -311,6 +332,9 @@ class AIOKafkaConsumer:
             sasl_kerberos_service_name=sasl_kerberos_service_name,
             sasl_kerberos_domain_name=sasl_kerberos_domain_name,
             sasl_oauth_token_provider=sasl_oauth_token_provider,
+            on_connection_opened=on_connection_opened,
+            on_connection_closed=on_connection_closed,
+            on_connection_failed=on_connection_failed,
         )
 
         self._group_id = group_id

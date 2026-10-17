@@ -1,0 +1,593 @@
+import asyncio
+import struct
+import weakref
+from dataclasses import FrozenInstanceError
+from unittest import mock
+
+import pytest
+
+from aiokafka import (
+    AIOKafkaClient,
+    AIOKafkaConsumer,
+    AIOKafkaProducer,
+    ConnectionCloseReason,
+    ConnectionGroup,
+    ConnectionInfo,
+)
+from aiokafka.conn import AIOKafkaConnection, CloseReason
+from aiokafka.connection import _ConnectionCallbacks
+from aiokafka.errors import (
+    CorrelationIdError,
+    KafkaConnectionError,
+    RequestTimedOutError,
+)
+from aiokafka.protocol.metadata import MetadataRequest, MetadataResponse_v0
+
+
+@pytest.fixture
+async def transport_factory(monkeypatch):
+    """Exercise real connection setup and teardown without a Kafka broker."""
+
+    async def connect(factory, host, port, **kwargs):
+        protocol = factory()
+        transport = mock.Mock(spec=asyncio.Transport)
+        transport.get_extra_info.return_value = None
+        transport.is_closing.return_value = False
+
+        def close():
+            if not transport.is_closing():
+                transport.is_closing.return_value = True
+                protocol.connection_lost(None)
+
+        transport.close.side_effect = close
+        protocol.connection_made(transport)
+        return transport, protocol
+
+    factory = mock.AsyncMock(side_effect=connect)
+    monkeypatch.setattr(asyncio.get_running_loop(), "create_connection", factory)
+    monkeypatch.setattr(AIOKafkaConnection, "_do_version_lookup", mock.AsyncMock())
+    monkeypatch.setattr(AIOKafkaConnection, "_do_sasl_handshake", mock.AsyncMock())
+    return factory
+
+
+@pytest.fixture
+async def client(transport_factory):
+    client = AIOKafkaClient(
+        client_id="observer-test",
+        on_connection_opened=mock.Mock(),
+        on_connection_closed=mock.Mock(),
+        on_connection_failed=mock.Mock(),
+    )
+    client.cluster.update_metadata(
+        MetadataResponse_v0([(1, "broker", 9092), (2, "other", 9093)], [])
+    )
+    try:
+        yield client
+    finally:
+        await client.close()
+
+
+async def drain(client):
+    tasks = tuple(client._connection_callbacks._tasks.values())
+    if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+
+def callback(client, event):
+    return client._connection_callbacks._callbacks[event]
+
+
+def test_public_types():
+    info = ConnectionInfo("client", "id", None, "host", 9092, ConnectionGroup.DEFAULT)
+    with pytest.raises(FrozenInstanceError):
+        info.node_id = 1
+    assert CloseReason is ConnectionCloseReason
+
+
+@pytest.mark.parametrize("cls", [AIOKafkaClient, AIOKafkaConsumer, AIOKafkaProducer])
+async def test_public_constructor_forwarding(cls):
+    opened, closed, failed = mock.Mock(), mock.Mock(), mock.Mock()
+    obj = cls(
+        on_connection_opened=opened,
+        on_connection_closed=closed,
+        on_connection_failed=failed,
+    )
+    client = (
+        obj if cls is AIOKafkaClient else getattr(obj, "_client", None) or obj.client
+    )
+    try:
+        assert client._connection_callbacks._callbacks == {
+            "opened": opened,
+            "closed": closed,
+            "failed": failed,
+        }
+    finally:
+        if cls is AIOKafkaClient:
+            await obj.close()
+        else:
+            await obj.stop()
+
+
+@pytest.mark.parametrize("event", ["opened", "closed", "failed"])
+async def test_invalid_callback(event):
+    with pytest.raises(TypeError, match=f"on_connection_{event} must be callable"):
+        AIOKafkaClient(**{f"on_connection_{event}": False})
+
+
+async def test_open_reuse_and_shutdown(client):
+    conn = await client._get_conn(1)
+    assert await client._get_conn(1) is conn
+    await drain(client)
+    opened = callback(client, "opened")
+    opened.assert_called_once()
+    info = opened.call_args.args[0]
+    assert info == ConnectionInfo(
+        "observer-test", info.connection_id, 1, "broker", 9092, ConnectionGroup.DEFAULT
+    )
+    await client.close()
+    callback(client, "closed").assert_called_once_with(
+        info, ConnectionCloseReason.SHUTDOWN, None
+    )
+    assert not client._connection_callbacks._tasks
+
+
+async def test_coordinator_connection_is_distinct(client):
+    conn = await client._get_conn(1)
+    coordinator = await client._get_conn(1, group=ConnectionGroup.COORDINATION)
+    assert coordinator is not conn
+    await drain(client)
+    first, second = [call.args[0] for call in callback(client, "opened").call_args_list]
+    assert first.connection_id != second.connection_id
+    assert first.connection_group is ConnectionGroup.DEFAULT
+    assert second.connection_group is ConnectionGroup.COORDINATION
+
+
+@pytest.mark.parametrize("brokers", [[], [(1, "broker", 9092)]])
+async def test_bootstrap_lifecycle(transport_factory, monkeypatch, brokers):
+    monkeypatch.setattr(
+        AIOKafkaConnection,
+        "send",
+        mock.AsyncMock(return_value=MetadataResponse_v0(brokers, [])),
+    )
+    opened, closed = mock.Mock(), mock.Mock()
+    client = AIOKafkaClient(
+        bootstrap_servers="bootstrap:9092",
+        on_connection_opened=opened,
+        on_connection_closed=closed,
+    )
+    try:
+        await client.bootstrap()
+        await drain(client)
+        opened.assert_called_once()
+        info = opened.call_args.args[0]
+        assert info.node_id is None
+        assert info.host == "bootstrap"
+        assert info.connection_group is ConnectionGroup.DEFAULT
+        if brokers:
+            closed.assert_called_once_with(info, None, None)
+        else:
+            closed.assert_not_called()
+            assert (
+                await client._get_conn("bootstrap")
+                is client._conns[("bootstrap", ConnectionGroup.DEFAULT)]
+            )
+            await client.close()
+            opened.assert_called_once()
+            closed.assert_called_once_with(info, ConnectionCloseReason.SHUTDOWN, None)
+    finally:
+        await client.close()
+
+
+async def test_failed_bootstrap_attempts(transport_factory):
+    error = OSError("unavailable")
+    transport_factory.side_effect = error
+    failed = mock.Mock()
+    client = AIOKafkaClient(
+        bootstrap_servers=["one:9092", "two:9093"], on_connection_failed=failed
+    )
+    try:
+        with pytest.raises(KafkaConnectionError):
+            await client.bootstrap()
+        await drain(client)
+        assert failed.call_count == 2
+        infos = [call.args[0] for call in failed.call_args_list]
+        assert {info.host for info in infos} == {"one", "two"}
+        assert len({info.connection_id for info in infos}) == 2
+        assert all(info.node_id is None for info in infos)
+        assert all(call.args[1] is error for call in failed.call_args_list)
+    finally:
+        await client.close()
+
+
+async def test_interruption_failed_retries_and_recovery(client, transport_factory):
+    conn = await client._get_conn(1)
+    await drain(client)
+    error = OSError("connection lost")
+    closed = asyncio.Event()
+    callback(client, "closed").side_effect = lambda *args: closed.set()
+    with mock.patch.object(client, "force_metadata_update") as refresh:
+        conn._reader.set_exception(error)
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        refresh.assert_called_once()
+    old_info = callback(client, "opened").call_args.args[0]
+    callback(client, "closed").assert_called_once_with(
+        old_info, ConnectionCloseReason.CONNECTION_BROKEN, error
+    )
+
+    connect = transport_factory.side_effect
+    transport_factory.side_effect = OSError("still unavailable")
+    assert await client._get_conn(1) is None
+    assert await client._get_conn(1) is None
+    await drain(client)
+    assert callback(client, "failed").call_count == 2
+    transport_factory.side_effect = connect
+    replacement = await client._get_conn(1)
+    assert replacement is not conn
+    await drain(client)
+    assert callback(client, "opened").call_count == 2
+    infos = [call.args[0] for call in callback(client, "opened").call_args_list]
+    infos += [call.args[0] for call in callback(client, "failed").call_args_list]
+    assert len({info.connection_id for info in infos}) == 4
+
+
+async def test_idle_closure(client):
+    conn = await client._get_conn(1)
+    conn._max_idle_ms = 0
+    conn._idle_handle.cancel()
+    conn._idle_check(weakref.ref(conn))
+    await drain(client)
+    callback(client, "closed").assert_called_once_with(
+        callback(client, "opened").call_args.args[0],
+        ConnectionCloseReason.IDLE_DROP,
+        None,
+    )
+
+
+async def test_timeout_preserves_error(client):
+    conn = await client._get_conn(1)
+    error = TimeoutError("request expired")
+    with (
+        mock.patch.object(conn, "send", mock.AsyncMock(side_effect=error)),
+        pytest.raises(RequestTimedOutError),
+    ):
+        await client.send(1, MetadataRequest([]))
+    await drain(client)
+    callback(client, "closed").assert_called_once_with(
+        callback(client, "opened").call_args.args[0],
+        ConnectionCloseReason.CONNECTION_TIMEOUT,
+        error,
+    )
+    callback(client, "failed").assert_not_called()
+
+
+async def test_write_failure_preserves_error(client):
+    conn = await client._get_conn(1)
+    conn._versions = {MetadataRequest.API_KEY: (0, 0)}
+    error = OSError("write failed")
+    conn._writer.transport.write.side_effect = error
+    with pytest.raises(KafkaConnectionError):
+        conn.send(MetadataRequest([]))
+    await drain(client)
+    assert callback(client, "closed").call_args.args[2] is error
+
+
+async def test_out_of_sync_preserves_error(client):
+    conn = await client._get_conn(1)
+    conn._versions = {MetadataRequest.API_KEY: (0, 0)}
+    response = conn.send(MetadataRequest([]))
+    conn._handle_frame(struct.pack(">i", -1))
+    with pytest.raises(CorrelationIdError) as raised:
+        await response
+    await drain(client)
+    callback(client, "closed").assert_called_once_with(
+        callback(client, "opened").call_args.args[0],
+        ConnectionCloseReason.OUT_OF_SYNC,
+        raised.value,
+    )
+
+
+@pytest.mark.parametrize("stage", ["transport", "version", "authentication"])
+async def test_establishment_failure_only_emits_failed(
+    client, transport_factory, monkeypatch, stage
+):
+    error = KafkaConnectionError("handshake failed")
+    if stage == "transport":
+        transport_factory.side_effect = error
+    else:
+        method = "_do_version_lookup" if stage == "version" else "_do_sasl_handshake"
+        monkeypatch.setattr(
+            AIOKafkaConnection, method, mock.AsyncMock(side_effect=error)
+        )
+        client._security_protocol = "SASL_PLAINTEXT"
+    assert await client._get_conn(1) is None
+    await drain(client)
+    callback(client, "failed").assert_called_once()
+    assert callback(client, "failed").call_args.args[1] is error
+    callback(client, "opened").assert_not_called()
+    callback(client, "closed").assert_not_called()
+
+
+async def test_open_waits_for_authentication(client, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def handshake(conn):
+        entered.set()
+        await release.wait()
+
+    client._security_protocol = "SASL_PLAINTEXT"
+    monkeypatch.setattr(AIOKafkaConnection, "_do_sasl_handshake", handshake)
+    task = asyncio.create_task(client._get_conn(1))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        callback(client, "opened").assert_not_called()
+    finally:
+        release.set()
+        await task
+    await drain(client)
+    callback(client, "opened").assert_called_once()
+
+
+async def test_cancelled_establishment_is_not_a_failure(client, monkeypatch):
+    monkeypatch.setattr(
+        AIOKafkaConnection,
+        "_do_version_lookup",
+        mock.AsyncMock(side_effect=asyncio.CancelledError),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await client._get_conn(1)
+    await drain(client)
+    for event in ("opened", "closed", "failed"):
+        callback(client, event).assert_not_called()
+
+
+async def test_close_at_end_of_handshake_keeps_order(client, monkeypatch):
+    events = []
+    callback(client, "opened").side_effect = lambda *args: events.append("opened")
+    callback(client, "closed").side_effect = lambda *args: events.append("closed")
+
+    async def lookup(conn):
+        conn.close(ConnectionCloseReason.IDLE_DROP)
+
+    monkeypatch.setattr(AIOKafkaConnection, "_do_version_lookup", lookup)
+    await client._get_conn(1)
+    await drain(client)
+    assert events == ["opened", "closed"]
+
+
+async def test_callbacks_are_ordered_per_connection_and_do_not_block_others(client):
+    entered, release = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def opened(info):
+        if info.node_id == 1:
+            entered.set()
+            await release.wait()
+        events.append(("opened", info.node_id))
+
+    callback(client, "opened").side_effect = opened
+    callback(client, "closed").side_effect = lambda info, *_: events.append(
+        ("closed", info.node_id)
+    )
+    first = await client._get_conn(1)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    first.close()
+    second = await client._get_conn(2)
+    second.close()
+    first_info = next(
+        call.args[0]
+        for call in callback(client, "opened").call_args_list
+        if call.args[0].node_id == 1
+    )
+    other_tasks = [
+        task
+        for key, task in client._connection_callbacks._tasks.items()
+        if key != first_info.connection_id
+    ]
+    await asyncio.wait_for(asyncio.gather(*other_tasks), timeout=1)
+    assert events == [("opened", 2), ("closed", 2)]
+    release.set()
+    await drain(client)
+    assert events == [("opened", 2), ("closed", 2), ("opened", 1), ("closed", 1)]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "error", [ValueError("observer failed"), asyncio.CancelledError()]
+)
+async def test_callback_errors_are_isolated(
+    client, transport_factory, caplog, asynchronous, error
+):
+    def broken(*args):
+        raise error
+
+    async def async_broken(*args):
+        raise error
+
+    for event in ("opened", "closed", "failed"):
+        callback(client, event).side_effect = async_broken if asynchronous else broken
+    conn = await client._get_conn(1)
+    assert conn.connected()
+    with mock.patch.object(conn, "send", mock.AsyncMock(return_value="response")):
+        assert await client.send(1, MetadataRequest([])) == "response"
+    transport_factory.side_effect = OSError("unavailable")
+    assert await client._get_conn(2) is None
+    await client.close()
+    assert "Error in on_connection_opened callback" in caplog.text
+    assert "Error in on_connection_closed callback" in caplog.text
+    assert "Error in on_connection_failed callback" in caplog.text
+    assert not client._connection_callbacks._tasks
+
+
+async def test_shutdown_cancels_slow_observers(client, monkeypatch):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def opened(info):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    callback(client, "opened").side_effect = opened
+    monkeypatch.setattr(_ConnectionCallbacks, "_SHUTDOWN_TIMEOUT", 0.01)
+    await client._get_conn(1)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(client.close(), timeout=1)
+    assert cancelled.is_set()
+    assert not client._connection_callbacks._tasks
+    callback(client, "closed").assert_not_called()
+
+
+async def test_callback_can_close_client(client):
+    stopped = asyncio.Event()
+
+    async def opened(info):
+        await client.close()
+        stopped.set()
+
+    callback(client, "opened").side_effect = opened
+    await client._get_conn(1)
+    await asyncio.wait_for(stopped.wait(), timeout=1)
+    await drain(client)
+    callback(client, "closed").assert_called_once()
+
+
+async def test_callback_can_acquire_connection_lock(client):
+    async def opened(info):
+        async with client._get_conn_lock:
+            assert client._conns[(info.node_id, info.connection_group)].connected()
+
+    callback(client, "opened").side_effect = opened
+    await client._get_conn(1)
+    await drain(client)
+
+
+async def test_disabled_callbacks_create_no_dispatcher(transport_factory):
+    client = AIOKafkaClient()
+    assert client._connection_callbacks is None
+    client.cluster.update_metadata(MetadataResponse_v0([(1, "broker", 9092)], []))
+    try:
+        conn = await client._get_conn(1)
+        assert conn._on_close_cb == client._on_connection_closed
+    finally:
+        await client.close()
+
+
+async def test_bootstrap_metadata_error_is_not_establishment_failure(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        AIOKafkaConnection,
+        "send",
+        mock.AsyncMock(side_effect=KafkaConnectionError("metadata request failed")),
+    )
+    with pytest.raises(KafkaConnectionError):
+        await client.bootstrap()
+    await drain(client)
+    callback(client, "opened").assert_called_once()
+    callback(client, "closed").assert_called_once()
+    callback(client, "failed").assert_not_called()
+
+
+async def test_missing_metadata_is_not_establishment_failure(client):
+    assert await client._get_conn(999) is None
+    await drain(client)
+    callback(client, "failed").assert_not_called()
+
+
+async def test_concurrent_connection_requests_emit_once(client):
+    first, second = await asyncio.gather(client._get_conn(1), client._get_conn(1))
+    assert first is second
+    await drain(client)
+    callback(client, "opened").assert_called_once()
+
+
+async def test_callback_returning_future_preserves_order(client):
+    future = asyncio.get_running_loop().create_future()
+    callback(client, "opened").return_value = future
+    conn = await client._get_conn(1)
+    conn.close()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    callback(client, "closed").assert_not_called()
+    future.set_result(None)
+    await drain(client)
+    callback(client, "closed").assert_called_once()
+
+
+@pytest.mark.skipif(not hasattr(asyncio, "eager_task_factory"), reason="Python 3.12+")
+async def test_eager_task_factory_defers_callbacks(client):
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        async with client._get_conn_lock:
+            conn = await client._create_connection("broker", 9092, node_id=1)
+            client._conns[(1, ConnectionGroup.DEFAULT)] = conn
+            callback(client, "opened").assert_not_called()
+        await drain(client)
+        callback(client, "opened").assert_called_once()
+    finally:
+        loop.set_task_factory(previous)
+
+
+async def test_multiple_callbacks_can_close_client(client):
+    stopped = []
+
+    async def opened(info):
+        await client.close()
+        stopped.append(info.node_id)
+
+    callback(client, "opened").side_effect = opened
+    await client._get_conn(1)
+    await client._get_conn(2)
+    await drain(client)
+    assert sorted(stopped) == [1, 2]
+
+
+async def test_shutdown_does_not_wait_for_suppressed_cancellation(client, monkeypatch):
+    entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def opened(info):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    callback(client, "opened").side_effect = opened
+    monkeypatch.setattr(_ConnectionCallbacks, "_SHUTDOWN_TIMEOUT", 0.01)
+    await client._get_conn(1)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    try:
+        await asyncio.wait_for(client.close(), timeout=1)
+        assert cancelled.is_set()
+    finally:
+        release.set()
+        await drain(client)
+    assert not client._connection_callbacks._tasks
+    callback(client, "closed").assert_not_called()
+
+
+async def test_cancelling_shutdown_cancels_observers(client):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def opened(info):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    callback(client, "opened").side_effect = opened
+    await client._get_conn(1)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    # Start shutdown directly on the dispatcher to cancel while it is draining.
+    closing = asyncio.create_task(client._connection_callbacks.close())
+    await asyncio.sleep(0)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert cancelled.is_set()
+    assert not client._connection_callbacks._tasks
