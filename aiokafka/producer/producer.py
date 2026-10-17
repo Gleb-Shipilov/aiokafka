@@ -6,14 +6,14 @@ import warnings
 
 from aiokafka.client import AIOKafkaClient
 from aiokafka.codec import has_gzip, has_lz4, has_snappy, has_zstd
-from aiokafka.connection import (
-    ConnectionClosedCallback,
-    ConnectionFailedCallback,
-    ConnectionOpenedCallback,
-)
 from aiokafka.errors import (
     IllegalOperation,
     MessageSizeTooLargeError,
+)
+from aiokafka.lifecycle import (
+    ConnectionClosedCallback,
+    ConnectionFailedCallback,
+    ConnectionOpenedCallback,
 )
 from aiokafka.metrics import ProducerMetricsCollector
 from aiokafka.partitioner import DefaultPartitioner

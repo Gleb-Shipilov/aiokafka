@@ -2,7 +2,9 @@ __version__ = "0.15.0rc1"
 
 from .abc import ConsumerRebalanceListener
 from .client import AIOKafkaClient
-from .connection import (
+from .consumer import AIOKafkaConsumer
+from .errors import ConsumerStoppedError, IllegalOperation
+from .lifecycle import (
     ConnectionClosedCallback,
     ConnectionCloseReason,
     ConnectionFailedCallback,
@@ -10,8 +12,6 @@ from .connection import (
     ConnectionInfo,
     ConnectionOpenedCallback,
 )
-from .consumer import AIOKafkaConsumer
-from .errors import ConsumerStoppedError, IllegalOperation
 from .metrics import ProducerMetricsCollector
 from .producer import AIOKafkaProducer
 from .structs import (

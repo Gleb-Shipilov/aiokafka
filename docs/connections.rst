@@ -38,7 +38,12 @@ resumed message processing. Bootstrap sockets may close normally as soon as
 metadata is obtained. A close with ``reason=None`` can represent this normal
 cleanup. ``IDLE_DROP`` identifies idle removal, ``SHUTDOWN`` identifies deliberate
 client shutdown, and ``CONNECTION_BROKEN`` or ``CONNECTION_TIMEOUT`` identify
-transport failures or request timeouts.
+transport failures or request timeouts. ``OUT_OF_SYNC`` reports a mismatched
+request/response correlation ID. ``AUTH_FAILURE`` is retained for compatibility
+with the low-level connection's closing reasons. Authentication fails before
+establishment completes, so public observers receive it only through
+``on_connection_failed(connection, error)``. Handle authentication alerts there;
+``on_connection_closed`` never reports ``AUTH_FAILURE``.
 
 For example, the same observers can be supplied to a consumer or producer:
 
@@ -105,7 +110,19 @@ including while its connection lock is held.
 On ``stop()`` (or ``AIOKafkaClient.close()``), connections close first, then
 pending observers have up to **five seconds in total** to finish. Remaining
 observer tasks are cancelled, and their queued notifications are discarded.
+Cancelling ``stop()`` or ``close()`` skips the remaining grace period and
+immediately requests cancellation of pending observers. Applications with a
+shorter termination budget can use ``asyncio.wait_for(client.stop(), timeout)``.
+This grace period is independent of Kafka's ``request_timeout_ms``.
+
 Cancellation is cooperative: callbacks must propagate cancellation promptly;
 shutdown does not wait indefinitely for a callback that suppresses it. If an
 observer itself stops the client, shutdown does not wait for that observer.
+A callback that suppresses cancellation can outlive ``stop()`` and retains its
+running task until it finishes. Stop the client before closing its event loop,
+and ensure callbacks propagate cancellation after any short cleanup. Arbitrary
+callback code cannot be forcibly terminated by asyncio. Closing a low-level
+connection between runs of its owning loop queues the notification on that
+loop; callbacks cannot be delivered after the loop has closed.
+
 With all three callbacks left as ``None``, no observer tasks are created.

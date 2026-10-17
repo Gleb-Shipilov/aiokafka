@@ -8,17 +8,17 @@ import warnings
 from aiokafka import __version__
 from aiokafka.abc import ConsumerRebalanceListener
 from aiokafka.client import AIOKafkaClient
-from aiokafka.connection import (
-    ConnectionClosedCallback,
-    ConnectionFailedCallback,
-    ConnectionOpenedCallback,
-)
 from aiokafka.coordinator.assignors.roundrobin import RoundRobinPartitionAssignor
 from aiokafka.errors import (
     ConsumerStoppedError,
     IllegalOperation,
     IllegalStateError,
     RecordTooLargeError,
+)
+from aiokafka.lifecycle import (
+    ConnectionClosedCallback,
+    ConnectionFailedCallback,
+    ConnectionOpenedCallback,
 )
 from aiokafka.structs import ConsumerRecord, TopicPartition
 from aiokafka.util import commit_structure_validate, get_running_loop

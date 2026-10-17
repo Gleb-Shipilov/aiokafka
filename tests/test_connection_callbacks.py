@@ -15,12 +15,12 @@ from aiokafka import (
     ConnectionInfo,
 )
 from aiokafka.conn import AIOKafkaConnection, CloseReason
-from aiokafka.connection import _ConnectionCallbacks
 from aiokafka.errors import (
     CorrelationIdError,
     KafkaConnectionError,
     RequestTimedOutError,
 )
+from aiokafka.lifecycle import _ConnectionCallbacks
 from aiokafka.protocol.metadata import MetadataRequest, MetadataResponse_v0
 
 
@@ -591,3 +591,153 @@ async def test_cancelling_shutdown_cancels_observers(client):
         await closing
     assert cancelled.is_set()
     assert not client._connection_callbacks._tasks
+
+
+@pytest.mark.parametrize("entrypoint", ["client", "consumer", "producer"])
+async def test_cancel_shutdown_during_transport_close(client, entrypoint):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def opened(info):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    callback(client, "opened").side_effect = opened
+    conn = await client._get_conn(1)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    # Transport shutdown is still pending when the caller cancels stop().
+    transport_closed = conn._closed_fut
+    conn._closed_fut = asyncio.get_running_loop().create_future()
+    if entrypoint == "consumer":
+        obj = AIOKafkaConsumer()
+        obj._client = client
+        stop = obj.stop
+    elif entrypoint == "producer":
+        obj = AIOKafkaProducer()
+        obj.client = client
+        stop = obj.stop
+    else:
+        stop = client.close
+    closing = asyncio.create_task(stop())
+    try:
+        await asyncio.sleep(0)
+        assert not conn.connected()
+        closing.cancel()
+        done, _ = await asyncio.wait({closing}, timeout=0.1)
+        assert closing in done, "Cancellation waited for the observer grace period"
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert cancelled.is_set()
+        assert not client._connection_callbacks._tasks
+    finally:
+        if not closing.done():
+            closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        conn._closed_fut = transport_closed
+
+
+@pytest.mark.parametrize(
+    "reason", [None, ConnectionCloseReason.SHUTDOWN, ConnectionCloseReason.IDLE_DROP]
+)
+def test_connection_close_between_loop_runs(reason):
+    loop = asyncio.new_event_loop()
+    closed = mock.Mock()
+
+    async def setup():
+        client = AIOKafkaClient(on_connection_closed=closed)
+
+        async def connect(host, port, **kwargs):
+            conn = AIOKafkaConnection(host, port, on_close=kwargs["on_close"])
+            conn._reader = mock.Mock()
+            conn._reader.at_eof.return_value = False
+            conn._writer = mock.Mock()
+            conn._read_task = loop.create_future()
+            conn._read_task.set_result(None)
+            conn._closed_fut = loop.create_future()
+            conn._closed_fut.set_result(None)
+            conn._idle_handle = loop.call_later(60, lambda: None)
+            return conn
+
+        with mock.patch("aiokafka.client.create_conn", side_effect=connect):
+            conn = await client._create_connection("broker", 9092, node_id=1)
+        client._conns[(1, ConnectionGroup.DEFAULT)] = conn
+        return client, conn
+
+    client, conn = loop.run_until_complete(setup())
+    try:
+        conn.close(reason)
+        assert conn._on_close_cb is None
+        assert conn._idle_handle.cancelled()
+        closed.assert_not_called()
+        loop.run_until_complete(client.close())
+        closed.assert_called_once()
+        assert closed.call_args.args[1] is reason
+        assert not client._connection_callbacks._tasks
+    finally:
+        loop.run_until_complete(client.close())
+        loop.close()
+
+
+def test_callbacks_use_explicit_client_loop(caplog):
+    loop = asyncio.new_event_loop()
+    opened = mock.Mock()
+    client = AIOKafkaClient(loop=loop, on_connection_opened=opened)
+    info = ConnectionInfo("client", "id", None, "host", 9092, ConnectionGroup.DEFAULT)
+    try:
+        client._connection_callbacks.emit("opened", info)
+        opened.assert_not_called()
+        loop.run_until_complete(drain(client))
+        opened.assert_called_once_with(info)
+    finally:
+        loop.close()
+    # A closed loop cannot run observers. No coroutine or task should be created.
+    client._connection_callbacks.emit("opened", info)
+    assert not client._connection_callbacks._tasks
+    assert not client._connection_callbacks._queues
+    assert "event loop is closed" in caplog.text
+    opened.assert_called_once()
+
+
+async def test_close_exception_is_released_after_notification(client):
+    conn = await client._get_conn(1)
+    error = OSError("connection lost")
+    conn.close(ConnectionCloseReason.CONNECTION_BROKEN, exc=error)
+    assert conn._close_exception is None
+    await drain(client)
+    assert callback(client, "closed").call_args.args[2] is error
+
+
+async def test_low_level_close_hook_remains_compatible(client):
+    conn = await client._get_conn(1)
+    received = []
+
+    def on_close(connection, reason):
+        received.append((connection, reason))
+
+    conn._on_close_cb = on_close
+    conn.close(ConnectionCloseReason.SHUTDOWN, exc=OSError("shutdown"))
+    assert received == [(conn, ConnectionCloseReason.SHUTDOWN)]
+    assert conn._close_exception is None
+
+
+async def test_cancel_observers_before_dispatch_starts():
+    current = asyncio.current_task()
+    current.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        opened = mock.Mock()
+        callbacks = _ConnectionCallbacks(opened, None, None)
+        info = ConnectionInfo(
+            "client", "id", None, "host", 9092, ConnectionGroup.DEFAULT
+        )
+        callbacks.emit("opened", info)
+        await callbacks.close()
+        assert not callbacks._tasks
+        assert not callbacks._queues
+        opened.assert_not_called()
+    finally:
+        current.uncancel()
