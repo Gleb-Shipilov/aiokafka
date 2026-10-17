@@ -121,13 +121,20 @@ Keep callbacks short and avoid blocking the event loop. Defer longer work to
 application tasks. Callbacks are never awaited by connection establishment,
 including while its connection lock is held.
 
-On ``stop()`` (or ``AIOKafkaClient.close()``), connections close first, then
-pending observers have up to **five seconds in total** to finish. Remaining
-observer tasks are cancelled, and their queued notifications are discarded.
-Cancelling ``stop()`` or ``close()`` skips the remaining grace period and
-immediately requests cancellation of pending observers. Applications with a
-shorter termination budget can use ``asyncio.wait_for(client.stop(), timeout)``.
-This grace period is independent of Kafka's ``request_timeout_ms``.
+During ``AIOKafkaClient.close()``, connections close first, then pending
+observers have up to **five seconds in total** to finish. Remaining observer
+tasks are cancelled, and their queued notifications are discarded. Cancellation
+while awaiting transport closure or draining observers skips the remaining
+grace period and requests cancellation of pending observers. This grace period
+is independent of Kafka's ``request_timeout_ms``.
+
+The five-second limit applies only to observer draining. Producer ``stop()``
+also waits for queued records and sender shutdown, and consumer ``stop()``
+closes its coordinator and fetcher before reaching ``AIOKafkaClient.close()``.
+Cancelling either ``stop()`` during those earlier stages can leave connections
+and observers running. Calling ``stop()`` again returns immediately because
+shutdown has already been marked as started. A timeout around ``stop()``
+therefore does not guarantee connection or observer cleanup.
 
 Cancellation is cooperative: callbacks must propagate cancellation promptly;
 shutdown does not wait indefinitely for a callback that suppresses it. If an
